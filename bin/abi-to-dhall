@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+usage() {
+  if [ "$1" ]; then echo >&2 "Error: $1"; fi
+  echo >&2 "
+Usage: abi-to-dall [--module NAME] [--namespace NAME] FILES..
+
+Arguments:
+  FILES..
+          ABI file paths
+
+Options:
+  --module NAME
+          Name of module, used to avoid conflicts
+  --namespace NAME
+          Name of solidity package, used to avoid conflicts
+
+Version: ${_VERSION:-unknown}
+"
+  exit 1
+}
+
+filepath() {
+  echo "$(cd ${1%/*} && pwd)/${1##*/}"
+}
+
+gen() {
+  local abiPath
+  abiPath="$1"
+  local binPath
+  binPath="${abiPath##*/}"
+  binPath="${binPath%.*}.bin"
+  binPath="${abiPath%/*}/$binPath"
+  local contractName
+  contractName="${abiPath##*/}"
+  contractName="${contractName%.*}"
+  local abiDhall
+  abiDhall="$OUT_ABI_DIR/$contractName"
+
+  echo -n >&2 "$abiPath -> "
+
+  if {
+    sed 's/\[[0-9]*\]"/_list"/g' "$abiPath" \
+      | json-to-dhall --records-strict --unions-first "($PACKAGE_PATH).abiSchema.Abi" \
+      > "$abiDhall" \
+    && dhall text <<<"($PACKAGE_PATH).abiGenerator \"$BIN_PREFIX\" \"$contractName\" $abiDhall" \
+      | dhall format > "$OUT_CON_DIR/$contractName"
+  }; then
+    {
+      cp "$abiPath" "$EVM_OUT_DIR/${BIN_PREFIX}$contractName.abi" || true
+      cp "$binPath" "$EVM_OUT_DIR/${BIN_PREFIX}$contractName.bin" || true
+    } >&2
+    echo >&2 "$OUT_CON_DIR/$contractName"
+  else
+    echo >&2 "Failed!"
+    exit 2
+  fi
+}
+
+updatePackage() {
+  local contracts
+  contracts=$(
+    cd "$OUT_DIR"
+    find -L "contract" -type f \
+           ! -path "*/Prelude/*" \
+      -and ! -name lib \
+      -and ! -name types \
+      -and ! -name renderer \
+    | sed 's|^\([^/]*\)/\(.*\)/\([^/]*\)$|/\\ { \2 = ./\1/\2/\3 }|;s|^contract/|/\\ ./contract/|'
+  )
+
+  rm -rf "$OUT_LIB_DIR/package"
+  dhall format <<<"
+    { contracts = {=} $contracts
+    } // ./lib // ./renderer // ./types
+  " > "$OUT_LIB_DIR/package"
+}
+
+main() {
+  mkdir -p \
+    "$OUT_ABI_DIR" "$OUT_CON_DIR" \
+    "$OUT_LIB_DIR" "$OUT_DEP_DIR" "$EVM_OUT_DIR"
+  cp -r -T "$PRELUDE_PATH" "$OUT_LIB_DIR/Prelude"
+  chmod -R +w "$OUT_LIB_DIR/Prelude"
+  ln -srfT "$OUT_LIB_DIR/Prelude" "$OUT_CON_DIR/Prelude"
+
+  dhall <<<"($PACKAGE_PATH).lib" > "$OUT_LIB_DIR/lib"
+  ln -srfT "$OUT_LIB_DIR/lib" "$OUT_CON_DIR/lib"
+
+  dhall <<<"($PACKAGE_PATH).renderer" > "$OUT_LIB_DIR/renderer"
+  ln -srfT "$OUT_LIB_DIR/renderer" "$OUT_CON_DIR/renderer"
+
+  dhall text <<<"($PACKAGE_PATH).typesGenerator ($PACKAGE_PATH).typesConversions" \
+    | dhall format > "$OUT_LIB_DIR/types"
+  ln -srfT "$OUT_LIB_DIR/types" "$OUT_CON_DIR/types"
+
+  for fn in "$@"; do gen "$fn"; done
+
+  updatePackage
+}
+
+while [ "$1" ]; do
+  case "$1" in
+    --module) shift
+      ATD_MODULE="${1//[-\/ ]/_}"
+      ;;
+    --namespace) shift
+      ATD_NAMESPACE="${1//[\/ ]/-}"
+      ;;
+    --update-package)
+      ATD_UPDATE_PACKAGE=1
+      ;;
+    -*)
+      usage "\"$1\" is not a recognized option."
+      ;;
+    *) break
+      ;;
+  esac
+  shift
+done
+
+if [[ -n $ATD_MODULE ]];    then BIN_PREFIX+="${ATD_MODULE}--"; fi
+if [[ -n $ATD_NAMESPACE ]]; then
+  BIN_PREFIX+="${ATD_NAMESPACE//-/_}-"
+  ATD_NAMESPACE="/$ATD_NAMESPACE"
+fi
+
+LIB_DIR=$(cd "${LIB_DIR:-${0%/*}/../dhall}" && pwd)
+PRELUDE_PATH=$(cd "${PRELUDE_PATH:-${0%/*}/../dhall-lang/Prelude}" && pwd)
+PACKAGE_PATH="$LIB_DIR/package.dhall"
+
+OUT_DIR="$PWD/atd"
+OUT_LIB_DIR="$OUT_DIR"
+OUT_ABI_DIR="$OUT_DIR/abi$ATD_NAMESPACE"
+OUT_CON_DIR="$OUT_DIR/contract$ATD_NAMESPACE"
+OUT_DEP_DIR="$OUT_DIR/dep"
+EVM_OUT_DIR="$OUT_DIR/evm"
+
+if [[ -n $ATD_UPDATE_PACKAGE ]]; then
+  [[ -d "$OUT_DIR/contract" ]] \
+    || { echo >&2 "No contracts present, doing nothing."; exit 0; }
+  updatePackage
+else
+  main "$@"
+fi

@@ -1,0 +1,177 @@
+#!/usr/bin/env node
+const fs = require('fs')
+const { spawn } = require('child_process');
+
+const command = process.argv[2]
+const opts = process.argv.slice(3)
+const enableEstimates = opts.indexOf("--estimate") !== -1
+const enableAsync = opts.indexOf("--async") !== -1
+const atdPath = process.env["ATD_PATH"] ? process.env["ATD_PATH"] : "./atd"
+
+function error(msg) {
+  console.error(`Error: ${msg}`)
+  process.exit(1)
+}
+
+function truncWarn(msg) {
+  console.warn(`WARNING POSSIBLE TRUNCATION: ${msg}`)
+}
+
+function divZeroError(msg) {
+  error(`ERROR DIVISION BY ZERO: ${msg}`)
+}
+
+function defVar(str) {
+  return `TX${str.padStart(5, "0")}`
+}
+
+function argTypes(node) {
+  return node.join(',')
+}
+
+function args(node) {
+  return node.map(op).map(x => `"${x}"`).join(' ')
+}
+
+function outputVal(type, val) {
+  return /^u?int/.test(type) ? val : `\\"${val}\\"`
+}
+
+function output(node) {
+  const type = node.type
+  const value = node.value
+  const json =
+    (value.op === 'lit')
+    ? (Array.isArray(value.value)
+      ? `[ ${value.value.map(v => outputVal(type, v)).join(', ')} ]`
+      : outputVal(type, value.value))
+    : `\\"${op(value)}\\"`
+  return `out "${node.id}" "${json}"`
+}
+
+function math(node) {
+  const mop = n => isNaN(n) ? op(n) : n
+  const parse =
+    { add: n => `(${mop(n.x)} + ${mop(n.y)})`
+    , sub: n => `(${mop(n.x)} - ${mop(n.y)})`
+    , mul: n => `(${mop(n.x)} * ${mop(n.y)})`
+    , div: n => (y => y == 0 ? divZeroError(JSON.stringify(n)) : `(${mop(n.x)} / ${y})`)(mop(n.y))
+    , pow: n => `(${mop(n.x)} ^ ${mop(n.y)})`
+    , log: n => `l(${mop(n.x)})`
+    , exp: n => `e(${mop(n.x)})`
+    }
+
+  if (!(node.mathOp in parse))
+    error(`Math OP type "${node.mathOp}" not recognized.`)
+
+  return parse[node.mathOp](node)
+}
+
+function estimate(node) {
+  if (!enableEstimates) return ""
+
+  const parse =
+    { send: n => `est $(seth estimate "${op(n.address)}" "${n.function}(${argTypes(n.argTypes)})" ${args(n.args)})`
+    , call: n => `est $(seth estimate "${op(n.address)}" "${n.function}(${argTypes(n.argTypes)})(${argTypes(n.outputTypes)})" ${args(n.args)}) `
+    , create: n => `est $(seth estimate --create "${atdPath}/evm/${n.prefix}${n.contract}.bin" "${n.contract}(${argTypes(n.argTypes)})" ${args(n.args)})`
+    }
+
+  if (!(node.op in parse)) return ""
+
+  return parse[node.op](node) + "\n"
+}
+
+function nonce() {
+  return enableAsync ? "\nETH_NONCE=$((ETH_NONCE + 1))" : ""
+}
+
+function sendAsync() {
+  return enableAsync ? "SETH_ASYNC=yes " : ""
+}
+
+function callDef(node) {
+  const f =
+    n => (n.type === "address" || n.type[0] === "address")
+      ? `0x\${${defVar(n.callDef)}#0x}`
+      : `\${${defVar(n.callDef)}}`
+  return (enableAsync && node.opType === "create")
+    ? `$(seth receipt "${f(node)}" contractAddress)`
+    : f(node)
+}
+
+function op(node) {
+  const parse =
+    { def: n => `${estimate(n.def)}${defVar(n.id)}=$(${op(n.def)})${nonce()}`
+    , send: n => `${estimate(n)}${sendAsync()}seth send "${op(n.address)}" "${n.function}(${argTypes(n.argTypes)})" ${args(n.args)}`
+    , call: n => `${sendAsync()}seth call "${op(n.address)}" "${n.function}(${argTypes(n.argTypes)})(${argTypes(n.outputTypes)})" ${args(n.args)}`
+    , create: n => `${sendAsync()}seth send --create "${atdPath}/evm/${n.prefix}${n.contract}.bin" "${n.contract}(${argTypes(n.argTypes)})" ${args(n.args)}`
+    , sig: n => `$(seth sig "${n.sig}")`
+    , callDef: callDef
+    , asciiToHex: n => `$(seth --from-ascii "${n.asciiToHex}")`
+    , fromHex: n => (
+        truncWarn(`Expression '${op(n.value)}' might be truncated when cast to '${n.type}'.`),
+        /^(u?int256|bytes32)$/.test(n.type)
+          ? `0x$(seth --to-${n.type} "${op(n.value)}")`
+          : op(n.value))
+    , toHex: n =>
+        /^(u?int256|bytes32)$/.test(n.type)
+          ? `0x$(seth --to-${n.type} "${op(n.value)}")`
+          : op(n.value)
+    , lit: n =>
+        /^(u?int256|bytes32)$/.test(n.type)
+          ? `0x$(seth --to-${n.type} "${n.value}")`
+          : n.value
+    , from: _ => `$ETH_FROM`
+    , math: math
+    , mathToHex: n => `0x$(seth --to-uint256 $(math "scale=${n.scale};${op(n.value)}"))`
+    , output: output
+    , noop: _ => null
+    }
+
+  if (!(node.op in parse))
+    error(`OP type "${node.op}" not recognized.`)
+
+  return parse[node.op](node)
+}
+
+function ast(node) {
+  const ops = node.ops.map(op)
+  return `#!/usr/bin/env bash
+: \${ETH_FROM?} \${ETH_GAS?}
+math() { { local x=$(bc -l <<<"$1");printf %s \${x%.*}; } 2>/dev/null; }
+out() { { echo "$_sep \\"$1\\": $2";_sep=,; } 2>/dev/null; }${
+enableEstimates ? `
+est() { { estimates+="$_esep $1";_esep=,; } 2>/dev/null; }` : ""}
+
+echo -n "{";
+trap 'exit 130' INT
+trap 'exit 131' TERM
+trap '{ echo "$_sep \\"meta\\":
+  { \\"runtime\\": \\"atd-to-seth\\"${
+enableEstimates ? `
+  , \\"estimates\\": [$estimates ]` : ""}
+  , \\"exit\\": $?
+  , \\"date\\": \\"$(date -u +"%FT%T.000Z")\\"
+  }
+}"; } 2>/dev/null' EXIT
+set -ex${
+enableAsync ? `
+
+export ETH_NONCE=$(seth nonce "$ETH_FROM")` : ""}
+
+${ops.filter(o => o != null).join("\n")}`
+}
+
+const data = fs.readFileSync(0, 'utf-8')
+const script = ast(JSON.parse(data))
+
+if (command === 'run') {
+  const child = spawn('bash')
+  child.on('close', code => process.exit(code));
+  child.stdout.pipe(process.stdout, { end: false });
+  child.stderr.pipe(process.stderr, { end: false });
+  child.stdin.write(script)
+  child.stdin.end();
+} else {
+  console.log(script)
+}
