@@ -1,5 +1,13 @@
  # abi-to-dhall
 
+### Note
+
+This is a fork-merge of [https://github.com/icetan/abi-to-dhall](https://github.com/icetan/abi-to-dhall) 
+
+Learning nix and dhall - not for production
+
+## Abstract
+
 Generate a Dhall based DSL for deploying Ethereum contracts.
 
 ## Why
