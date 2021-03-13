@@ -1,4 +1,4 @@
-name: "Test"
+name: "nix-test"
 on:
   pull_request:
   push:
@@ -14,5 +14,6 @@ jobs:
         signingKey: '${{ secrets.CACHIX_SIGNING_KEY }}'
         # Only needed for private caches
         #authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    - run: nix-env -iA nixpkgs.myPackages
     - run: nix-build
     - run: nix-shell --run "echo OK"
